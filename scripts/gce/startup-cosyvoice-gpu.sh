@@ -42,7 +42,7 @@ rm -rf "$VENV_PATH"
 "$PYTHON_BIN" -m venv "$VENV_PATH"
 source "$VENV_PATH/bin/activate"
 python -m pip install --upgrade pip 'setuptools<81' wheel
-python -m pip install --index-url https://download.pytorch.org/whl/cu124 torch==2.5.1 torchaudio==2.5.1
+python -m pip install --extra-index-url https://download.pytorch.org/whl/cpu torch==2.3.1 torchaudio==2.3.1
 python -m pip install \
   conformer==0.3.2 \
   diffusers==0.29.0 \
@@ -63,7 +63,7 @@ python -m pip install \
   numpy==1.26.4 \
   omegaconf==2.3.0 \
   onnx==1.16.0 \
-  onnxruntime-gpu==1.18.0 \
+  onnxruntime==1.18.0 \
   protobuf==4.25 \
   pyarrow==18.1.0 \
   pydantic==2.7.0 \
