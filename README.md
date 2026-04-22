@@ -1,6 +1,9 @@
-# Pika Voice Backend
+# PikaProjBackend
 
-Reference backend for the iOS `Open Messages` screen.
+Reference backend for the Pika iOS app and `Open Messages` screen.
+
+Related repo:
+- iOS app: `https://github.com/barif-7/PikaProjiOS`
 
 It exposes:
 - `GET /health`
@@ -119,7 +122,7 @@ Your command is responsible for producing a WAV file at `COSYVOICE_OUTPUT_PATH`.
 For a repo-local setup, point `COSYVOICE_COMMAND` at the bundled runner:
 
 ```env
-COSYVOICE_COMMAND=python3 voice-backend/scripts/run_cosyvoice.py
+COSYVOICE_COMMAND=python3 scripts/run_cosyvoice.py
 COSYVOICE_MODEL_DIR=/absolute/path/to/CosyVoice/pretrained_models/CosyVoice-300M
 COSYVOICE_REPO_DIR=/absolute/path/to/CosyVoice
 COSYVOICE_INFERENCE_MODE=zero_shot
@@ -127,12 +130,12 @@ COSYVOICE_LANGUAGE=en
 TTS_PROVIDER=cosyvoice
 ```
 
-With that configuration, `run_cosyvoice.py` automatically falls back to the bundled local adapter at [scripts/cosyvoice_local_adapter.py](/Users/basilarif/Documents/GitHub/PikaProj/voice-backend/scripts/cosyvoice_local_adapter.py). The adapter expects a real CosyVoice checkout and Python environment with the CosyVoice dependencies installed.
+With that configuration, `run_cosyvoice.py` automatically falls back to the bundled local adapter at `scripts/cosyvoice_local_adapter.py`. The adapter expects a real CosyVoice checkout and Python environment with the CosyVoice dependencies installed.
 
 To bootstrap a dedicated CosyVoice environment without polluting the main backend venv, use:
 
 ```bash
-bash voice-backend/scripts/setup_cosyvoice_env.sh
+bash scripts/setup_cosyvoice_env.sh
 ```
 
 The setup script intentionally requires Python `3.10`, `3.11`, or `3.12`. It will fail fast on older interpreters such as the repo's current Python `3.9` backend venv.
@@ -481,7 +484,7 @@ If you are only deploying the auth/session/API layer first, leave the voice-mode
 
 Set one of:
 - `VOICE_CHAT_BASE_URL`
-- `VoiceChatBaseURL` in `PikaTakeHome/Info.plist`
+- `VoiceChatBaseURL` in the iOS app's `Info.plist`
 
 Examples:
 - Simulator: `http://127.0.0.1:8080`
