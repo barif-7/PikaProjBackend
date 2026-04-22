@@ -1,0 +1,1 @@
+"""Voice chat backend package."""
