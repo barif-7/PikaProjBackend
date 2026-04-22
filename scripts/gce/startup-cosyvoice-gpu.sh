@@ -38,6 +38,7 @@ if [ ! -d "$REPO_DIR/.git" ]; then
   git clone https://github.com/FunAudioLLM/CosyVoice "$REPO_DIR"
 fi
 
+rm -rf "$VENV_PATH"
 "$PYTHON_BIN" -m venv "$VENV_PATH"
 source "$VENV_PATH/bin/activate"
 python -m pip install --upgrade pip 'setuptools<81' wheel
