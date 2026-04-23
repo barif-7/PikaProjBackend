@@ -279,7 +279,12 @@ def _load_json_map(path: Path) -> dict[str, Any]:
 
 
 def _save_json_map(path: Path, payload: dict[str, Any]) -> None:
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    # Atomic write: serialise to a sibling temp file and os.replace into place
+    # so we never leave a truncated/half-written JSON file on disk if the
+    # process is killed mid-write.
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    tmp_path.replace(path)
 
 
 def _utc_now_iso() -> str:

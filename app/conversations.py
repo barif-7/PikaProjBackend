@@ -73,7 +73,11 @@ def _load_json_map(path: Path) -> dict[str, Any]:
 
 
 def _save_json_map(path: Path, payload: dict[str, Any]) -> None:
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    # Atomic write to avoid leaving a half-written file if the process dies
+    # mid-save; a corrupt conversations.json would erase chat history.
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    tmp_path.replace(path)
 
 
 def _default_conversation_payload(conversation_id: str) -> dict[str, Any]:

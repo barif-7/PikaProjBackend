@@ -522,7 +522,12 @@ def _load_jobs(path: Path) -> dict[str, Any]:
     if not raw:
         return {}
 
-    jobs = json.loads(raw)
+    try:
+        jobs = json.loads(raw)
+    except json.JSONDecodeError:
+        # Tolerate a corrupted jobs file rather than crashing the worker loop.
+        # A fresh empty state will be written on the next save.
+        return {}
     root_dir = path.parent
     profiles_dir = root_dir / "profile-models"
     for job_id, job in jobs.items():
@@ -554,7 +559,12 @@ def _load_jobs(path: Path) -> dict[str, Any]:
 
 
 def _save_jobs(path: Path, jobs: dict[str, Any]) -> None:
-    path.write_text(json.dumps(jobs, indent=2, sort_keys=True), encoding="utf-8")
+    # Atomic write — the worker loop is constantly rewriting this file, and a
+    # partial write would corrupt every in-flight training job until the file
+    # is repaired manually.
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(jobs, indent=2, sort_keys=True), encoding="utf-8")
+    tmp_path.replace(path)
 
 
 def _is_cosyvoice_model_dir(path: Path) -> bool:
