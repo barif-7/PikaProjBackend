@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import unittest
+import base64
+import io
+import wave
 
+from app.audio_upload import AudioUploadChunk, decode_uploaded_audio
+from app.models import VoiceChatTurnRequest, VoiceProfileSubmitRequest
 from app.providers import (
     OllamaRuntimeConfig,
     VoiceChatProviderError,
@@ -23,9 +28,22 @@ def _make_settings(**overrides) -> Settings:
         google_oauth_client_secret=None,
         google_oauth_callback_url=None,
         auth_mobile_callback_scheme="pikatakehome",
+        auth_mobile_callback_url=None,
         auth_data_dir="/tmp/auth",
         auth_session_ttl_seconds=3600.0,
         conversation_data_dir="/tmp/conv",
+        persistence_backend="json",
+        auth_users_collection="pikaUsers",
+        auth_sessions_collection="pikaSessions",
+        auth_connections_collection="pikaProviderConnections",
+        conversations_collection="pikaConversations",
+        oauth_state_secret="test-secret",
+        ollama_endpoint_allowlist="",
+        max_audio_base64_bytes=50 * 1024 * 1024,
+        require_api_key=False,
+        api_key=None,
+        apple_app_site_association_app_ids="",
+        universal_link_paths="/auth/google/*",
         prewarm_ollama_on_startup=False,
         whisper_command="whisper",
         whisper_model="base",
@@ -49,8 +67,18 @@ def _make_settings(**overrides) -> Settings:
         voice_profile_gcs_prefix="voice-profiles",
         voice_profile_firestore_collection="voiceProfiles",
         voice_profile_jobs_firestore_collection="voiceProfileJobs",
+        voice_job_storage_bucket=None,
+        voice_job_gcs_prefix="voice-jobs",
+        voice_job_firestore_collection="voiceChatJobs",
         tts_timeout_seconds=75.0,
         http_timeout_seconds=90.0,
+        stt_timeout_seconds=60.0,
+        llm_timeout_seconds=90.0,
+        max_concurrent_voice_jobs=10,
+        voice_job_ttl_seconds=600.0,
+        voice_job_worker_poll_seconds=1.0,
+        voice_job_worker_lease_seconds=300.0,
+        voice_job_worker_concurrency=1,
     )
     defaults.update(overrides)
     return Settings(**defaults)
@@ -150,6 +178,89 @@ class OllamaRuntimeTests(unittest.TestCase):
         )
         with self.assertRaises(Exception):
             cfg.model = "other"  # type: ignore[misc]
+
+
+class AudioChunkUploadTests(unittest.TestCase):
+    def test_chunked_audio_decodes_back_to_wav(self) -> None:
+        chunk_one = self._make_wav_chunk(duration_seconds=1.0)
+        chunk_two = self._make_wav_chunk(duration_seconds=1.0)
+        combined = decode_uploaded_audio(
+            None,
+            [
+                AudioUploadChunk(
+                    index=0,
+                    totalChunks=2,
+                    fileName="chunk-0.wav",
+                    mimeType="audio/wav",
+                    durationSeconds=1.0,
+                    audioBase64=base64.b64encode(chunk_one).decode("utf-8"),
+                ),
+                AudioUploadChunk(
+                    index=1,
+                    totalChunks=2,
+                    fileName="chunk-1.wav",
+                    mimeType="audio/wav",
+                    durationSeconds=1.0,
+                    audioBase64=base64.b64encode(chunk_two).decode("utf-8"),
+                ),
+            ],
+        )
+
+        with wave.open(io.BytesIO(combined), "rb") as reader:
+            self.assertEqual(reader.getnchannels(), 1)
+            self.assertEqual(reader.getframerate(), 16000)
+            self.assertEqual(reader.getnframes(), 32000)
+
+    def test_chunked_requests_validate_without_audio_base64(self) -> None:
+        chat_request = VoiceChatTurnRequest.model_validate(
+            {
+                "audioChunks": [
+                    {
+                        "index": 0,
+                        "totalChunks": 1,
+                        "fileName": "turn.wav",
+                        "mimeType": "audio/wav",
+                        "durationSeconds": 1.0,
+                        "audioBase64": base64.b64encode(self._make_wav_chunk(1.0)).decode("utf-8"),
+                    }
+                ],
+                "fileName": "turn.wav",
+                "durationSeconds": 1.0,
+            }
+        )
+        profile_request = VoiceProfileSubmitRequest.model_validate(
+            {
+                "transcript": "hello",
+                "audioChunks": [
+                    {
+                        "index": 0,
+                        "totalChunks": 1,
+                        "fileName": "sample.wav",
+                        "mimeType": "audio/wav",
+                        "durationSeconds": 1.0,
+                        "audioBase64": base64.b64encode(self._make_wav_chunk(1.0)).decode("utf-8"),
+                    }
+                ],
+                "fileName": "sample.wav",
+                "durationSeconds": 1.0,
+            }
+        )
+
+        self.assertEqual(chat_request.fileName, "turn.wav")
+        self.assertEqual(profile_request.fileName, "sample.wav")
+        self.assertEqual(len(chat_request.audioChunks), 1)
+        self.assertEqual(len(profile_request.audioChunks), 1)
+
+    def _make_wav_chunk(self, duration_seconds: float) -> bytes:
+        sample_rate = 16000
+        frame_count = int(sample_rate * duration_seconds)
+        output = io.BytesIO()
+        with wave.open(output, "wb") as writer:
+            writer.setnchannels(1)
+            writer.setsampwidth(2)
+            writer.setframerate(sample_rate)
+            writer.writeframes(b"\x00\x00" * frame_count)
+        return output.getvalue()
 
 
 if __name__ == "__main__":

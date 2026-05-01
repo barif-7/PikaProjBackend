@@ -14,6 +14,7 @@ from typing import Optional
 
 import httpx
 
+from .audio_upload import AudioUploadError, decode_uploaded_audio
 from .config import Settings
 from .durable_storage import build_durable_voice_profile_store
 from .models import VoiceChatTurnRequest, VoiceChatTurnResponse
@@ -50,7 +51,10 @@ async def generate_turn_response(
     ollama_runtime: Optional[OllamaRuntimeConfig] = None,
 ) -> VoiceChatTurnResponse:
     request_started_at = time.perf_counter()
-    audio_bytes = _decode_audio(payload.audioBase64)
+    try:
+        audio_bytes = decode_uploaded_audio(payload.audioBase64, payload.audioChunks)
+    except AudioUploadError as exc:
+        raise VoiceChatProviderError(str(exc)) from exc
 
     with tempfile.TemporaryDirectory(prefix="pika-voice-chat-") as temp_dir:
         temp_path = Path(temp_dir)

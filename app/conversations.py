@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
-from typing import Any, Optional
+from typing import Any, Optional, TYPE_CHECKING
 
 
 _STORE_LOCK = Lock()
@@ -58,7 +58,18 @@ class ConversationStore:
         return payload
 
 
-def make_conversation_store(root_dir: str) -> ConversationStore:
+def make_conversation_store(root_dir: str, settings: "Any | None" = None) -> "ConversationStore | Any":
+    """
+    Return the appropriate conversation store.
+
+    If ``settings`` is provided and ``settings.persistence_backend == "firestore"``,
+    returns a FirestoreConversationStore.  Otherwise returns the local JSON-file
+    ConversationStore (default, suitable for dev / single-instance deployments).
+    """
+    if settings is not None and getattr(settings, "persistence_backend", "json") == "firestore":
+        # Local import avoids module-load circular dependency.
+        from .store_firestore import make_firestore_conversation_store
+        return make_firestore_conversation_store(settings)
     return ConversationStore(root_dir=Path(root_dir))
 
 

@@ -136,15 +136,75 @@ class AuthStoreTests(unittest.TestCase):
 
 
 class GoogleOAuthStateTests(unittest.TestCase):
-    def test_encode_decode_round_trip(self) -> None:
+    _SECRET = "test-secret-for-state-signing-!!!"
+
+    def test_encode_decode_round_trip_no_secret(self) -> None:
+        """Legacy path: decode_google_state without a secret still works for bare payloads."""
         payload = {"nonce": "xyz", "mobile_callback": "pikatakehome://cb"}
         encoded = _encode_state(payload)
-        decoded = decode_google_state(encoded)
+        decoded = decode_google_state(encoded)  # no secret → legacy decode
         self.assertEqual(decoded, payload)
+
+    def test_signed_encode_decode_round_trip(self) -> None:
+        """Signed state: encode via build_google_authorize_url logic, decode with secret."""
+        from app.security import sign_oauth_state
+        payload = {"nonce": "abc", "mobile_callback": "pikatakehome://cb"}
+        encoded = _encode_state(payload)
+        signed = sign_oauth_state(encoded, self._SECRET)
+        decoded = decode_google_state(signed, secret=self._SECRET)
+        self.assertEqual(decoded, payload)
+
+    def test_tampered_signed_state_raises(self) -> None:
+        from app.security import sign_oauth_state
+        payload = {"nonce": "abc", "mobile_callback": "pikatakehome://cb"}
+        encoded = _encode_state(payload)
+        signed = sign_oauth_state(encoded, self._SECRET)
+        tampered = "X" + signed[1:]
+        with self.assertRaises(AuthError):
+            decode_google_state(tampered, secret=self._SECRET)
+
+    def test_wrong_secret_raises(self) -> None:
+        from app.security import sign_oauth_state
+        payload = {"nonce": "abc", "mobile_callback": "pikatakehome://cb"}
+        encoded = _encode_state(payload)
+        signed = sign_oauth_state(encoded, self._SECRET)
+        with self.assertRaises(AuthError):
+            decode_google_state(signed, secret="wrong-secret")
 
     def test_decode_rejects_garbage(self) -> None:
         with self.assertRaises(AuthError):
             decode_google_state("this is not base64!!!")
+
+    def test_session_response_includes_expires_at(self) -> None:
+        """session_response dict must now include expiresAt so the client can track TTL."""
+        with tempfile.TemporaryDirectory() as td:
+            store = _make_store(Path(td))
+            store.create_google_session(
+                google_sub="xyz", email="e@x.com", display_name="E",
+            )
+            sessions_path = Path(td) / "sessions.json"
+            sessions = json.loads(sessions_path.read_text("utf-8"))
+            (token,) = sessions.keys()
+
+            resp = store.session_response(token)
+            self.assertIn("expiresAt", resp)
+            self.assertIsNotNone(resp["expiresAt"])
+
+    def test_session_response_slides_expiry_forward(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = _make_store(Path(td))
+            store.create_google_session(
+                google_sub="xyz", email="e@x.com", display_name="E",
+            )
+            sessions_path = Path(td) / "sessions.json"
+            sessions_before = json.loads(sessions_path.read_text("utf-8"))
+            (token,) = sessions_before.keys()
+            before = sessions_before[token]["expires_at"]
+
+            time.sleep(0.01)
+            resp = store.session_response(token)
+            after = resp["expiresAt"]
+            self.assertGreater(after, before)
 
 
 class ExpiryParserTests(unittest.TestCase):

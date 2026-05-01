@@ -12,6 +12,7 @@ from time import sleep
 from typing import Any
 from uuid import uuid4
 
+from .audio_upload import AudioUploadError, decode_uploaded_audio
 from .durable_storage import build_durable_voice_profile_store
 from .models import (
     VoiceProfileCapabilitiesResponse,
@@ -48,12 +49,29 @@ class VoiceProfileStore:
     def _jobs_path(self) -> Path:
         return self.root_dir / "jobs.json"
 
+    def _load_jobs_state(self) -> dict[str, Any]:
+        if self.durable_store and self.durable_store.enabled:
+            jobs = self.durable_store.list_jobs()
+            if jobs:
+                _save_jobs(self._jobs_path, jobs)
+                return jobs
+        return _load_jobs(self._jobs_path)
+
+    def _save_jobs_state(self, jobs: dict[str, Any]) -> None:
+        _save_jobs(self._jobs_path, jobs)
+        if self.durable_store and self.durable_store.enabled:
+            for job in jobs.values():
+                self.durable_store.save_job(job)
+
     def submit(
         self,
         payload: VoiceProfileSubmitRequest,
         user_id: Any = None,
     ) -> VoiceProfileSubmitResponse:
-        audio_bytes = _decode_audio(payload.audioBase64)
+        try:
+            audio_bytes = decode_uploaded_audio(payload.audioBase64, payload.audioChunks)
+        except AudioUploadError as exc:
+            raise VoiceProfileTrainingError(str(exc)) from exc
         job_id = uuid4().hex
         base_manifest = self._load_profile_manifest(payload.baseProfileID, user_id) if payload.baseProfileID else None
         profile_family_id = (base_manifest or {}).get("profile_family_id") or (base_manifest or {}).get("profile_id") or f"voice-profile-{job_id[:8]}"
@@ -71,7 +89,7 @@ class VoiceProfileStore:
         manifest_path = self.root_dir / "profiles" / f"{profile_id}.json"
 
         with _STORE_LOCK:
-            jobs = _load_jobs(self._jobs_path)
+            jobs = self._load_jobs_state()
             jobs[job_id] = {
                 "job_id": job_id,
                 "profile_id": profile_id,
@@ -104,7 +122,7 @@ class VoiceProfileStore:
                 "eval_metrics": (base_manifest or {}).get("eval_metrics"),
                 "promoted_at": (base_manifest or {}).get("promoted_at"),
             }
-            _save_jobs(self._jobs_path, jobs)
+            self._save_jobs_state(jobs)
 
         self._write_profile_manifest(jobs[job_id], state="queued")
         self._sync_job_to_durable_store(jobs[job_id])
@@ -112,16 +130,16 @@ class VoiceProfileStore:
 
     def status(self, job_id: str, user_id: Any = None) -> VoiceProfileJobStatusResponse:
         with _STORE_LOCK:
-            jobs = _load_jobs(self._jobs_path)
+            jobs = self._load_jobs_state()
             job = jobs.get(job_id)
 
         if not job and self.durable_store and self.durable_store.enabled:
             job = self.durable_store.load_job(job_id)
             if job:
                 with _STORE_LOCK:
-                    jobs = _load_jobs(self._jobs_path)
+                    jobs = self._load_jobs_state()
                     jobs[job_id] = job
-                    _save_jobs(self._jobs_path, jobs)
+                    self._save_jobs_state(jobs)
 
         if not job:
             raise VoiceProfileTrainingError(f"Unknown voice training job: {job_id}")
@@ -129,7 +147,7 @@ class VoiceProfileStore:
 
         self._refresh_artifact_state(job)
         with _STORE_LOCK:
-            refreshed_job = _load_jobs(self._jobs_path).get(job_id) or job
+            refreshed_job = self._load_jobs_state().get(job_id) or job
         return VoiceProfileJobStatusResponse(
             status=refreshed_job["status"],
             progress=refreshed_job.get("progress"),
@@ -235,7 +253,7 @@ class VoiceProfileStore:
 
     def _tick_jobs(self) -> None:
         with _STORE_LOCK:
-            jobs = _load_jobs(self._jobs_path)
+            jobs = self._load_jobs_state()
             dirty = False
 
             for job in jobs.values():
@@ -245,26 +263,26 @@ class VoiceProfileStore:
             processing_jobs = [job for job in jobs.values() if job["status"] == "processing"]
             if processing_jobs:
                 if dirty:
-                    _save_jobs(self._jobs_path, jobs)
+                    self._save_jobs_state(jobs)
                 return
 
             queued_job = next((job for job in jobs.values() if job["status"] == "queued"), None)
             if not queued_job:
                 if dirty:
-                    _save_jobs(self._jobs_path, jobs)
+                    self._save_jobs_state(jobs)
                 return
 
             queued_job["status"] = "processing"
             queued_job["progress"] = 0.2
             queued_job["message"] = "Starting voice profile training."
             queued_job["updated_at"] = _utc_now_iso()
-            _save_jobs(self._jobs_path, jobs)
+            self._save_jobs_state(jobs)
 
         self._run_training_job(queued_job["job_id"])
 
     def _run_training_job(self, job_id: str) -> None:
         with _STORE_LOCK:
-            jobs = _load_jobs(self._jobs_path)
+            jobs = self._load_jobs_state()
             job = jobs.get(job_id)
             if not job:
                 return
@@ -370,7 +388,7 @@ class VoiceProfileStore:
 
     def _mark_processing(self, job: dict[str, Any], progress: float, message: str) -> None:
         with _STORE_LOCK:
-            jobs = _load_jobs(self._jobs_path)
+            jobs = self._load_jobs_state()
             stored_job = jobs.get(job["job_id"])
             if not stored_job:
                 return
@@ -378,13 +396,13 @@ class VoiceProfileStore:
             stored_job["progress"] = progress
             stored_job["message"] = message
             stored_job["updated_at"] = _utc_now_iso()
-            _save_jobs(self._jobs_path, jobs)
+            self._save_jobs_state(jobs)
             self._write_profile_manifest(stored_job, state="processing")
             self._sync_job_to_durable_store(stored_job)
 
     def _mark_ready(self, job: dict[str, Any]) -> None:
         with _STORE_LOCK:
-            jobs = _load_jobs(self._jobs_path)
+            jobs = self._load_jobs_state()
             stored_job = jobs.get(job["job_id"])
             if not stored_job:
                 return
@@ -392,13 +410,13 @@ class VoiceProfileStore:
             stored_job["progress"] = 1.0
             stored_job["message"] = "Voice profile ready."
             stored_job["updated_at"] = _utc_now_iso()
-            _save_jobs(self._jobs_path, jobs)
+            self._save_jobs_state(jobs)
             self._write_profile_manifest(stored_job, state="ready")
             self._sync_job_to_durable_store(stored_job)
 
     def _mark_failed(self, job: dict[str, Any], message: str) -> None:
         with _STORE_LOCK:
-            jobs = _load_jobs(self._jobs_path)
+            jobs = self._load_jobs_state()
             stored_job = jobs.get(job["job_id"])
             if not stored_job:
                 return
@@ -406,7 +424,7 @@ class VoiceProfileStore:
             stored_job["progress"] = None
             stored_job["message"] = message
             stored_job["updated_at"] = _utc_now_iso()
-            _save_jobs(self._jobs_path, jobs)
+            self._save_jobs_state(jobs)
             self._write_profile_manifest(stored_job, state="failed")
             self._sync_job_to_durable_store(stored_job)
 

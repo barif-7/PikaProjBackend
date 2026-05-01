@@ -10,11 +10,15 @@ It exposes:
 - `GET /auth/google/start`
 - `GET /auth/google/callback`
 - `GET /auth/session`
+- `POST /auth/session/refresh`
 - `DELETE /auth/session`
+- `GET /.well-known/apple-app-site-association`
 - `GET /conversations/default`
 - `PUT /conversations/default`
 - `GET /provider-connections/ollama`
 - `PUT /provider-connections/ollama`
+- `POST /voice-chat/jobs`
+- `GET /voice-chat/jobs/{jobId}`
 - `POST /voice-chat/turn`
 - `POST /voice-profiles`
 - `GET /voice-profiles/capabilities`
@@ -44,6 +48,10 @@ Optional auth env vars:
 - `AUTH_SESSION_TTL_SECONDS`
 
 The iOS app opens `GET /auth/google/start?mobile_callback=pikatakehome://auth/google`, the backend handles the Google callback, then redirects back to the app with a session token. The app stores that session token in Keychain and reuses it across launches.
+
+`POST /auth/session/refresh` returns the same payload shape as `GET /auth/session`
+while extending the current session TTL. The backend also performs sliding
+session extension on authenticated session reads.
 
 Current provider connection support:
 - `GET /provider-connections/ollama`
@@ -94,6 +102,10 @@ Voice profiles are now structured as a versioned lineage rather than a single on
 - XTTS reference generation can merge multiple stored user samples into one stronger reference clip
 
 This is the foundation for a future "gets better over time" pipeline. The current system still uses XTTS reference conditioning rather than full continual fine-tuning, but it now preserves sample history and profile versions so a stronger trainer can be introduced later without losing user data.
+
+Long voice-profile samples may also arrive as `audioChunks` instead of a single
+base64 blob; the backend reconstructs them before training so the client can
+keep upload size and worst-case latency lower for longer recordings.
 
 ## CosyVoice provider
 
@@ -161,11 +173,14 @@ That keeps the current multi-sample reference-building pipeline, but marks the r
 
 ## Request contract
 
-`POST /voice-chat/turn`
+Primary async path:
+
+`POST /voice-chat/jobs`
 
 ```json
 {
   "audioBase64": "<base64 m4a>",
+  "audioChunks": [],
   "mimeType": "audio/m4a",
   "fileName": "turn.m4a",
   "durationSeconds": 4.2,
@@ -177,10 +192,29 @@ That keeps the current multi-sample reference-building pipeline, but marks the r
 }
 ```
 
-Successful response:
+For longer recordings, the iOS client may omit `audioBase64` and instead send
+`audioChunks` as a sequence of 15-second WAV chunks. The backend accepts either
+shape and reconstructs the full upload before transcription.
+
+Accepted response:
 
 ```json
 {
+  "jobId": "voice-job-1234",
+  "stage": "queued"
+}
+```
+
+Poll for completion:
+
+`GET /voice-chat/jobs/{jobId}`
+
+Successful ready response:
+
+```json
+{
+  "jobId": "voice-job-1234",
+  "stage": "ready",
   "transcript": "I feel scattered.",
   "responseText": "Then narrow the next move. Pick one meaningful task and finish it cleanly.",
   "responseAudioBase64": "<optional base64 wav>",
@@ -189,7 +223,16 @@ Successful response:
 }
 ```
 
-Error response shape is the same JSON with `error` populated and an HTTP `5xx` status.
+Failed jobs return the same payload shape with `stage: "failed"` and `error`
+populated.
+
+Legacy compatibility path:
+
+`POST /voice-chat/turn`
+
+This still executes the full turn inline, but the iOS app now uses the async
+job path above so the backend can queue work and distribute execution across
+instances.
 
 ## Prerequisites
 

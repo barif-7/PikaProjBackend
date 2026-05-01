@@ -1,7 +1,13 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
 from typing import List, Optional
+
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from .audio_upload import AudioUploadChunk, _sanitize_file_name
+
+
+_HARD_MAX_AUDIO_B64_BYTES = 200 * 1024 * 1024
 
 
 class ChatHistoryMessage(BaseModel):
@@ -19,6 +25,9 @@ class AuthenticatedUser(BaseModel):
 class AuthSessionResponse(BaseModel):
     sessionToken: str
     user: AuthenticatedUser
+    # Expiry timestamp (ISO-8601 UTC) so the iOS client can show a refresh UI
+    # or proactively re-authenticate before the session expires.
+    expiresAt: Optional[str] = None
 
 
 class OllamaConnectionRequest(BaseModel):
@@ -26,6 +35,16 @@ class OllamaConnectionRequest(BaseModel):
     model: Optional[str] = None
     apiToken: Optional[str] = None
     label: Optional[str] = None
+
+    @field_validator("endpointURL")
+    @classmethod
+    def endpoint_url_not_empty(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("endpointURL must not be blank.")
+        if len(v) > 2048:
+            raise ValueError("endpointURL is too long (max 2048 characters).")
+        return v
 
 
 class OllamaConnectionResponse(BaseModel):
@@ -55,13 +74,41 @@ class ConversationStateUpdateRequest(BaseModel):
 
 
 class VoiceChatTurnRequest(BaseModel):
-    audioBase64: str
+    audioBase64: Optional[str] = None
+    audioChunks: List[AudioUploadChunk] = Field(default_factory=list)
     mimeType: str = Field(default="audio/wav")
     fileName: str
     durationSeconds: float
     voiceProfileID: Optional[str] = None
     conversationSummary: Optional[str] = None
     history: List[ChatHistoryMessage] = Field(default_factory=list)
+
+    @field_validator("fileName")
+    @classmethod
+    def sanitize_file_name(cls, v: str) -> str:
+        return _sanitize_file_name(v)
+
+    @field_validator("audioBase64")
+    @classmethod
+    def audio_size_limit(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        if len(v) > 200 * 1024 * 1024:
+            raise ValueError("audioBase64 payload exceeds the hard maximum of 200 MB.")
+        return v
+
+    @field_validator("durationSeconds")
+    @classmethod
+    def duration_positive(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError("durationSeconds must be non-negative.")
+        return v
+
+    @model_validator(mode="after")
+    def requires_audio_source(self) -> "VoiceChatTurnRequest":
+        if not self.audioBase64 and not self.audioChunks:
+            raise ValueError("Either audioBase64 or audioChunks must be provided.")
+        return self
 
 
 class VoiceChatTurnResponse(BaseModel):
@@ -77,8 +124,39 @@ class VoiceProfileSubmitRequest(BaseModel):
     durationSeconds: float
     fileName: str
     mimeType: str = Field(default="audio/wav")
-    audioBase64: str
+    audioBase64: Optional[str] = None
+    audioChunks: List[AudioUploadChunk] = Field(default_factory=list)
     baseProfileID: Optional[str] = None
+
+    @field_validator("fileName")
+    @classmethod
+    def sanitize_file_name(cls, v: str) -> str:
+        return _sanitize_file_name(v)
+
+    @field_validator("audioBase64")
+    @classmethod
+    def audio_size_limit(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        if len(v) > _HARD_MAX_AUDIO_B64_BYTES:
+            raise ValueError(
+                f"audioBase64 payload exceeds the hard maximum of "
+                f"{_HARD_MAX_AUDIO_B64_BYTES // (1024 * 1024)} MB."
+            )
+        return v
+
+    @field_validator("durationSeconds")
+    @classmethod
+    def duration_positive(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError("durationSeconds must be non-negative.")
+        return v
+
+    @model_validator(mode="after")
+    def requires_audio_source(self) -> "VoiceProfileSubmitRequest":
+        if not self.audioBase64 and not self.audioChunks:
+            raise ValueError("Either audioBase64 or audioChunks must be provided.")
+        return self
 
 
 class VoiceProfileSubmitResponse(BaseModel):
@@ -98,3 +176,25 @@ class VoiceProfileCapabilitiesResponse(BaseModel):
     trainingMode: str
     supportsPersonalizedVoice: bool
     message: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Async voice-chat job models (POST /voice-chat/jobs)
+# ---------------------------------------------------------------------------
+
+class VoiceChatJobSubmitResponse(BaseModel):
+    """Returned immediately when a voice-chat job is accepted."""
+    jobId: str
+    stage: str = "queued"
+
+
+class VoiceChatJobStatusResponse(BaseModel):
+    """Returned when polling GET /voice-chat/jobs/{job_id}."""
+    jobId: str
+    # stage: queued | transcribing | generating | synthesizing | ready | failed
+    stage: str
+    transcript: Optional[str] = None
+    responseText: Optional[str] = None
+    responseAudioBase64: Optional[str] = None
+    responseAudioMimeType: Optional[str] = None
+    error: Optional[str] = None

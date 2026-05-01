@@ -7,12 +7,13 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
-from typing import Any, Optional
+from typing import Any, Optional, Union
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import httpx
 
 from .config import Settings
+from .security import sign_oauth_state, verify_and_extract_state
 
 
 GOOGLE_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -104,12 +105,17 @@ class AuthStore:
                 _save_json_map(self._sessions_path, sessions)
                 raise AuthError("Session expired.")
 
+            session["expires_at"] = _utc_after_seconds_iso(self.session_ttl_seconds)
+            sessions[session_token] = session
+            _save_json_map(self._sessions_path, sessions)
+
             user = users.get(session["user_id"])
             if not user:
                 raise AuthError("Session user is missing.")
 
             return {
                 "sessionToken": session_token,
+                "expiresAt": session.get("expires_at"),
                 "user": {
                     "userId": user["user_id"],
                     "email": user["email"],
@@ -117,6 +123,9 @@ class AuthStore:
                     "photoURL": user.get("photo_url"),
                 },
             }
+
+    def refresh_session(self, session_token: str) -> dict[str, Any]:
+        return self.session_response(session_token)
 
     def revoke_session(self, session_token: str) -> None:
         with _STORE_LOCK:
@@ -169,7 +178,17 @@ class AuthStore:
         return ollama
 
 
-def make_auth_store(settings: Settings) -> AuthStore:
+def make_auth_store(settings: Settings) -> "AuthStore | Any":
+    """
+    Return the appropriate auth store based on PERSISTENCE_BACKEND.
+
+    - "json"      → AuthStore (local JSON files, default, suitable for dev/single-instance)
+    - "firestore" → FirestoreAuthStore (Firestore-backed, required for horizontal scaling)
+    """
+    if settings.persistence_backend == "firestore":
+        # Local import to avoid a module-load-time circular dependency.
+        from .store_firestore import make_firestore_auth_store
+        return make_firestore_auth_store(settings)
     return AuthStore(
         root_dir=Path(settings.auth_data_dir),
         session_ttl_seconds=settings.auth_session_ttl_seconds,
@@ -180,13 +199,27 @@ def build_google_authorize_url(settings: Settings, mobile_callback: str) -> str:
     if not settings.google_oauth_client_id or not settings.google_oauth_client_secret or not settings.google_oauth_callback_url:
         raise AuthConfigurationError("Google OAuth is not configured on the backend.")
 
-    callback_scheme = urlparse(mobile_callback).scheme
-    expected_scheme = settings.auth_mobile_callback_scheme
-    if expected_scheme and callback_scheme != expected_scheme:
-        raise AuthConfigurationError("The mobile callback scheme is not allowed.")
+    callback_parsed = urlparse(mobile_callback)
+    callback_scheme = callback_parsed.scheme.lower()
+    expected_scheme = settings.auth_mobile_callback_scheme.lower()
+    if not expected_scheme:
+        raise AuthConfigurationError("AUTH_MOBILE_CALLBACK_SCHEME is not configured.")
+    if callback_scheme != expected_scheme:
+        raise AuthConfigurationError(
+            f"The mobile callback scheme '{callback_scheme}' is not allowed.  "
+            f"Expected '{expected_scheme}'."
+        )
+    # Reject obviously dangerous callback schemes even if they somehow match.
+    if callback_scheme in ("http", "https", "javascript", "data", "vbscript"):
+        raise AuthConfigurationError(
+            "The mobile callback must use a custom app URL scheme, not a web URL."
+        )
 
     state_payload = {"nonce": secrets.token_urlsafe(12), "mobile_callback": mobile_callback}
-    encoded_state = _encode_state(state_payload)
+    payload_b64 = _encode_state(state_payload)
+    # Sign the state so that the mobile_callback cannot be tampered with in transit.
+    signed_state = sign_oauth_state(payload_b64, settings.oauth_state_secret)
+
     query = urlencode(
         {
             "client_id": settings.google_oauth_client_id,
@@ -195,7 +228,7 @@ def build_google_authorize_url(settings: Settings, mobile_callback: str) -> str:
             "scope": "openid email profile",
             "access_type": "offline",
             "prompt": "select_account",
-            "state": encoded_state,
+            "state": signed_state,
         }
     )
     return f"{GOOGLE_AUTHORIZE_URL}?{query}"
@@ -243,10 +276,25 @@ async def exchange_google_code_for_user(settings: Settings, code: str) -> dict[s
     }
 
 
-def decode_google_state(encoded_state: str) -> dict[str, Any]:
+def decode_google_state(encoded_state: str, secret: Optional[str] = None) -> dict[str, Any]:
+    """
+    Verify the HMAC signature and decode the OAuth state payload.
+
+    If ``secret`` is provided the signature is verified and a tampered state
+    raises ``AuthError``.  If ``secret`` is None the state is decoded without
+    verification (legacy behaviour — only used in tests that do not set a
+    secret).
+    """
     try:
-        return json.loads(_urlsafe_b64decode(encoded_state).decode("utf-8"))
-    except Exception as exc:  # pragma: no cover - defensive decode boundary
+        if secret:
+            payload_b64 = verify_and_extract_state(encoded_state, secret)
+        else:
+            # Legacy path — no signing.  Accept bare base64 payload.
+            payload_b64 = encoded_state
+        return json.loads(_urlsafe_b64decode(payload_b64).decode("utf-8"))
+    except AuthError:
+        raise
+    except Exception as exc:
         raise AuthError("Invalid OAuth state.") from exc
 
 

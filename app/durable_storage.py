@@ -5,7 +5,10 @@ import os
 from pathlib import Path
 from typing import Any
 
-from google.cloud import firestore, storage
+try:
+    from google.cloud import firestore, storage
+except ImportError:  # pragma: no cover - optional in stripped local test envs
+    firestore = storage = None  # type: ignore[assignment]
 
 
 class DurableVoiceProfileStore:
@@ -21,9 +24,9 @@ class DurableVoiceProfileStore:
         self.gcs_prefix = gcs_prefix.strip().strip("/") or "voice-profiles"
         self.profiles_collection = profiles_collection.strip() or "voiceProfiles"
         self.jobs_collection = jobs_collection.strip() or "voiceProfileJobs"
-        self._firestore_client: firestore.Client | None = None
-        self._storage_client: storage.Client | None = None
-        self._bucket: storage.Bucket | None = None
+        self._firestore_client: Any = None
+        self._storage_client: Any = None
+        self._bucket: Any = None
 
     @property
     def enabled(self) -> bool:
@@ -44,6 +47,20 @@ class DurableVoiceProfileStore:
         if not isinstance(data, dict):
             return None
         return data
+
+    def list_jobs(self) -> dict[str, dict[str, Any]]:
+        if not self.enabled:
+            return {}
+        jobs: dict[str, dict[str, Any]] = {}
+        for snapshot in self._firestore().collection(self.jobs_collection).stream():
+            if not snapshot.exists:
+                continue
+            data = snapshot.to_dict() or {}
+            if not isinstance(data, dict):
+                continue
+            job_id = str(data.get("job_id") or snapshot.id)
+            jobs[job_id] = data
+        return jobs
 
     def save_manifest(self, profile_id: str, manifest: dict[str, Any]) -> None:
         if not self.enabled:
@@ -164,17 +181,21 @@ class DurableVoiceProfileStore:
 
         return updated
 
-    def _firestore(self) -> firestore.Client:
+    def _firestore(self) -> Any:
+        if firestore is None:
+            raise RuntimeError("google-cloud-firestore is not installed.")
         if self._firestore_client is None:
             self._firestore_client = firestore.Client()
         return self._firestore_client
 
-    def _storage(self) -> storage.Client:
+    def _storage(self) -> Any:
+        if storage is None:
+            raise RuntimeError("google-cloud-storage is not installed.")
         if self._storage_client is None:
             self._storage_client = storage.Client()
         return self._storage_client
 
-    def _get_bucket(self) -> storage.Bucket:
+    def _get_bucket(self) -> Any:
         if self._bucket is None:
             assert self.bucket_name is not None
             self._bucket = self._storage().bucket(self.bucket_name)
