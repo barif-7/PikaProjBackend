@@ -76,6 +76,9 @@ class ConversationStateUpdateRequest(BaseModel):
 class VoiceChatTurnRequest(BaseModel):
     audioBase64: Optional[str] = None
     audioChunks: List[AudioUploadChunk] = Field(default_factory=list)
+    # Alternatively, reference a previously uploaded audio blob by its upload ID
+    # (returned by POST /audio/uploads).  Mutually exclusive with audioBase64/audioChunks.
+    audioUploadID: Optional[str] = None
     mimeType: str = Field(default="audio/wav")
     fileName: str
     durationSeconds: float
@@ -106,8 +109,10 @@ class VoiceChatTurnRequest(BaseModel):
 
     @model_validator(mode="after")
     def requires_audio_source(self) -> "VoiceChatTurnRequest":
-        if not self.audioBase64 and not self.audioChunks:
-            raise ValueError("Either audioBase64 or audioChunks must be provided.")
+        has_inline = bool(self.audioBase64 or self.audioChunks)
+        has_ref = bool(self.audioUploadID)
+        if not has_inline and not has_ref:
+            raise ValueError("Either audioBase64, audioChunks, or audioUploadID must be provided.")
         return self
 
 
@@ -119,6 +124,12 @@ class VoiceChatTurnResponse(BaseModel):
     error: Optional[str] = None
 
 
+class AudioUploadResponse(BaseModel):
+    """Returned by POST /audio/uploads — use uploadId in subsequent job submissions."""
+    uploadId: str
+    expiresInSeconds: int
+
+
 class VoiceProfileSubmitRequest(BaseModel):
     transcript: str
     durationSeconds: float
@@ -126,6 +137,8 @@ class VoiceProfileSubmitRequest(BaseModel):
     mimeType: str = Field(default="audio/wav")
     audioBase64: Optional[str] = None
     audioChunks: List[AudioUploadChunk] = Field(default_factory=list)
+    # Reference a previously uploaded audio blob instead of sending inline audio.
+    audioUploadID: Optional[str] = None
     baseProfileID: Optional[str] = None
 
     @field_validator("fileName")
@@ -154,8 +167,10 @@ class VoiceProfileSubmitRequest(BaseModel):
 
     @model_validator(mode="after")
     def requires_audio_source(self) -> "VoiceProfileSubmitRequest":
-        if not self.audioBase64 and not self.audioChunks:
-            raise ValueError("Either audioBase64 or audioChunks must be provided.")
+        has_inline = bool(self.audioBase64 or self.audioChunks)
+        has_ref = bool(self.audioUploadID)
+        if not has_inline and not has_ref:
+            raise ValueError("Either audioBase64, audioChunks, or audioUploadID must be provided.")
         return self
 
 

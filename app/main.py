@@ -6,11 +6,17 @@ import socket
 import uuid
 
 import httpx
-from fastapi import FastAPI, Header, Query, Request
+from fastapi import FastAPI, File, Form, Header, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, RedirectResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from typing import Any, Dict, Optional, Union
 
+from .observability import (
+    RateLimitMiddleware,
+    RequestIDMiddleware,
+    RequestLoggingMiddleware,
+    UserTurnQuotaMiddleware,
+)
 from .auth import (
     AuthConfigurationError,
     AuthError,
@@ -25,7 +31,9 @@ from .config import load_settings
 from .conversations import make_conversation_store
 from .security import SSRFError, parse_ollama_allowlist, validate_ollama_endpoint
 from .store import AuthStoreProtocol, ConversationStoreProtocol
+from .audio_store import AudioUploadStore
 from .models import (
+    AudioUploadResponse,
     AuthSessionResponse,
     ConversationStateResponse,
     ConversationStateUpdateRequest,
@@ -64,6 +72,7 @@ auth_store: AuthStoreProtocol = make_auth_store(settings)
 conversation_store: ConversationStoreProtocol = make_conversation_store(
     settings.conversation_data_dir, settings=settings
 )
+audio_upload_store = AudioUploadStore(ttl_seconds=settings.audio_upload_ttl_seconds)
 
 # Initialised in startup_event; None until then.
 _voice_job_store: Optional[VoiceJobStoreProtocol] = None
@@ -123,6 +132,24 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(ApiKeyMiddleware)
 
+# Observability — added last so they execute outermost (first on ingress,
+# last on egress).  Starlette applies middleware in reverse-registration order
+# for the *request* direction, so register them after ApiKeyMiddleware so that
+# rate limiting runs before API-key checks.
+if settings.rate_limit_requests_per_minute > 0:
+    app.add_middleware(
+        RateLimitMiddleware,
+        rate_per_minute=settings.rate_limit_requests_per_minute,
+        burst=settings.rate_limit_burst,
+    )
+if settings.max_turns_per_user_per_day > 0:
+    app.add_middleware(
+        UserTurnQuotaMiddleware,
+        max_turns_per_day=settings.max_turns_per_user_per_day,
+    )
+app.add_middleware(RequestLoggingMiddleware)
+app.add_middleware(RequestIDMiddleware)
+
 
 async def _run_blocking(func: Any, /, *args: Any, **kwargs: Any) -> Any:
     """Run synchronous store work off the FastAPI event loop."""
@@ -154,6 +181,9 @@ async def startup_event() -> None:
         for index in range(settings.voice_job_worker_concurrency)
     ]
 
+    app.state.audio_upload_eviction_task = asyncio.create_task(
+        _evict_audio_uploads_loop(audio_upload_store, settings.audio_upload_ttl_seconds)
+    )
     app.state.prewarm_task = None
     if settings.prewarm_ollama_on_startup or settings.prewarm_whisper_on_startup:
         app.state.prewarm_task = asyncio.create_task(prewarm_runtime(settings))
@@ -169,12 +199,19 @@ async def startup_event() -> None:
 
 
 @app.get("/health")
-async def health() -> Dict[str, Any]:
+async def health(request: Request) -> Dict[str, Any]:
     return {
         "status": "ok",
+        "request_id": getattr(request.state, "request_id", None),
         "tts": {
             "provider": settings.tts_provider,
             "cosyvoice": await _get_cosyvoice_health(),
+        },
+        "limits": {
+            "rate_limit_requests_per_minute": settings.rate_limit_requests_per_minute,
+            "rate_limit_burst": settings.rate_limit_burst,
+            "max_turns_per_user_per_day": settings.max_turns_per_user_per_day,
+            "max_concurrent_voice_jobs": settings.max_concurrent_voice_jobs,
         },
     }
 
@@ -375,12 +412,67 @@ async def put_default_conversation(
         return JSONResponse(status_code=401, content={"message": str(exc)})
 
 
+@app.post("/audio/uploads", response_model=AudioUploadResponse)
+async def upload_audio(
+    file: UploadFile = File(...),
+    durationSeconds: float = Form(default=0.0),
+) -> Union[JSONResponse, AudioUploadResponse]:
+    """
+    Upload audio via multipart/form-data and receive an ``uploadId``.
+
+    Use the ``uploadId`` in place of ``audioBase64`` / ``audioChunks`` when
+    calling ``POST /voice-chat/jobs`` or ``POST /voice-profiles``.  The
+    upload is single-use and expires after ``AUDIO_UPLOAD_TTL_SECONDS``
+    (default 300 s).
+
+    This endpoint does not require authentication — callers are expected to
+    submit the audio alongside a valid bearer token when they use the upload ID.
+    """
+    max_bytes = settings.max_audio_base64_bytes  # reuse the same ceiling
+    audio_bytes = await file.read(max_bytes + 1)
+    if len(audio_bytes) > max_bytes:
+        return JSONResponse(
+            status_code=413,
+            content={
+                "message": (
+                    f"Audio file is too large.  "
+                    f"Maximum allowed: {max_bytes // (1024 * 1024)} MB."
+                )
+            },
+        )
+
+    mime_type = (file.content_type or "application/octet-stream").lower()
+    file_name = file.filename or "audio.bin"
+
+    from .audio_upload import _sanitize_file_name
+    try:
+        file_name = _sanitize_file_name(file_name)
+    except ValueError:
+        file_name = "audio.bin"
+
+    upload_id = await audio_upload_store.store(
+        audio_bytes=audio_bytes,
+        mime_type=mime_type,
+        file_name=file_name,
+        duration_seconds=max(0.0, durationSeconds),
+    )
+    return AudioUploadResponse(
+        uploadId=upload_id,
+        expiresInSeconds=int(settings.audio_upload_ttl_seconds),
+    )
+
+
 @app.post("/voice-chat/turn", response_model=VoiceChatTurnResponse)
 async def voice_chat_turn(
     payload: VoiceChatTurnRequest,
     authorization: Optional[str] = Header(default=None),
 ) -> Union[JSONResponse, VoiceChatTurnResponse]:
     try:
+        resolved = await _resolve_audio_upload(payload)
+        if isinstance(resolved, JSONResponse):
+            return resolved
+        payload = resolved
+
         # Configurable size guard (the model enforces a hard ceiling; this
         # enforces the operator-configurable per-deployment limit).
         if payload.audioBase64 is not None and len(payload.audioBase64) > settings.max_audio_base64_bytes:
@@ -434,6 +526,11 @@ async def submit_voice_profile(
     authorization: Optional[str] = Header(default=None),
 ) -> Union[JSONResponse, VoiceProfileSubmitResponse]:
     try:
+        resolved = await _resolve_audio_upload(payload)
+        if isinstance(resolved, JSONResponse):
+            return resolved
+        payload = resolved
+
         if payload.audioBase64 is not None and len(payload.audioBase64) > settings.max_audio_base64_bytes:
             return JSONResponse(
                 status_code=413,
@@ -456,6 +553,83 @@ async def submit_voice_profile(
         return JSONResponse(status_code=400, content={"message": str(exc)})
     except Exception as exc:  # pragma: no cover - defensive server boundary
         return JSONResponse(status_code=500, content={"message": f"Unexpected voice profile failure: {exc}"})
+
+
+@app.delete("/voice-profiles/{profile_id}", response_model=None)
+async def delete_voice_profile(
+    profile_id: str,
+    authorization: Optional[str] = Header(default=None),
+) -> Union[JSONResponse, dict]:
+    """
+    Delete a voice profile and all associated artifacts (local files, GCS objects,
+    Firestore documents).
+
+    The caller must own the profile.  Anonymous profiles (no ``user_id`` in the
+    manifest) can be deleted by any authenticated user.
+    """
+    try:
+        session = await _resolve_optional_session(authorization)
+        user_id = session["user"]["userId"] if session else None
+        await _run_blocking(voice_profile_store.delete_profile, profile_id, user_id)
+        return {"status": "deleted", "profileId": profile_id}
+    except AuthError as exc:
+        return JSONResponse(status_code=401, content={"message": str(exc)})
+    except VoiceProfileTrainingError as exc:
+        status_code = (
+            403 if "belongs to a signed-in user" in str(exc) or "do not have access" in str(exc) else 404
+        )
+        return JSONResponse(status_code=status_code, content={"message": str(exc)})
+    except Exception as exc:  # pragma: no cover - defensive server boundary
+        return JSONResponse(status_code=500, content={"message": f"Unexpected error: {exc}"})
+
+
+@app.delete("/auth/account", response_model=None)
+async def delete_account(
+    authorization: Optional[str] = Header(default=None),
+) -> Union[JSONResponse, dict]:
+    """
+    Delete the authenticated user's account and all associated data.
+
+    This is a destructive, non-reversible operation that removes:
+    - Auth user record and all active sessions
+    - Provider connections (Ollama)
+    - All stored conversations
+    - All owned voice profiles and artifacts (local + GCS + Firestore)
+
+    The bearer token used to make this call is also invalidated.
+    """
+    try:
+        session_token = extract_bearer_token(authorization)
+        session = await _run_blocking(auth_store.session_response, session_token)
+        user_id: str = session["user"]["userId"]
+
+        # 1. Delete voice profiles and artifacts.
+        deleted_profiles = await _run_blocking(
+            voice_profile_store.delete_user_profiles, user_id
+        )
+
+        # 2. Delete conversation history.
+        await _run_blocking(conversation_store.delete_user_conversations, user_id)
+
+        # 3. Delete auth data (user, sessions, connections) — also invalidates the
+        #    current session token so the client cannot make further authenticated calls.
+        await _run_blocking(auth_store.delete_user, user_id)
+
+        logger.info(
+            "[account-deletion] user_id=%s deleted profiles=%d",
+            user_id,
+            len(deleted_profiles),
+        )
+        return {
+            "status": "deleted",
+            "userId": user_id,
+            "deletedProfiles": len(deleted_profiles),
+        }
+    except AuthError as exc:
+        return JSONResponse(status_code=401, content={"message": str(exc)})
+    except Exception as exc:  # pragma: no cover - defensive server boundary
+        logger.exception("[account-deletion] unexpected error")
+        return JSONResponse(status_code=500, content={"message": f"Unexpected error: {exc}"})
 
 
 @app.get("/voice-profiles/capabilities", response_model=VoiceProfileCapabilitiesResponse)
@@ -512,6 +686,14 @@ async def _get_cosyvoice_health() -> Dict[str, Any]:
         status["reachable"] = False
         status["error"] = str(exc)
     return status
+
+
+async def _evict_audio_uploads_loop(store: AudioUploadStore, ttl_seconds: float) -> None:
+    """Background task: evict expired audio upload buffers every ttl/2 seconds."""
+    interval = max(30.0, ttl_seconds / 2)
+    while True:
+        await asyncio.sleep(interval)
+        await store.evict_expired()
 
 
 async def _evict_expired_jobs_loop(store: VoiceJobStoreProtocol, ttl_seconds: float) -> None:
@@ -582,6 +764,11 @@ async def submit_voice_chat_job(
         return JSONResponse(status_code=503, content={"message": "Service not ready."})
 
     try:
+        resolved = await _resolve_audio_upload(payload)
+        if isinstance(resolved, JSONResponse):
+            return resolved
+        payload = resolved
+
         if payload.audioBase64 is not None and len(payload.audioBase64) > settings.max_audio_base64_bytes:
             return JSONResponse(
                 status_code=413,
@@ -612,7 +799,11 @@ async def submit_voice_chat_job(
         try:
             job = await _voice_job_store.create(payload, ollama_runtime)
         except RuntimeError as exc:
-            return JSONResponse(status_code=429, content={"message": str(exc)})
+            return JSONResponse(
+                status_code=429,
+                content={"message": str(exc)},
+                headers={"Retry-After": "5"},
+            )
 
         return VoiceChatJobSubmitResponse(jobId=job.job_id, stage="queued")
 
@@ -652,6 +843,39 @@ async def get_voice_chat_job_status(
         resp.error = job.error
 
     return resp
+
+
+async def _resolve_audio_upload(payload: Any) -> Any:
+    """
+    If the request payload has ``audioUploadID`` set, claim the upload from the
+    store and populate ``audioBase64`` on a copy of the payload so that the rest
+    of the pipeline treats it identically to an inline audio submission.
+
+    Returns the payload unchanged if no ``audioUploadID`` is present.
+    Raises ``JSONResponse`` (HTTP 404) if the ID is unknown or expired.
+    """
+    upload_id = getattr(payload, "audioUploadID", None)
+    if not upload_id:
+        return payload
+
+    entry = await audio_upload_store.claim(upload_id)
+    if entry is None:
+        return JSONResponse(
+            status_code=404,
+            content={"message": f"Audio upload '{upload_id}' not found or has expired."},
+        )
+
+    import base64 as _b64
+    updated = payload.model_copy(
+        update={
+            "audioBase64": _b64.b64encode(entry.audio_bytes).decode(),
+            "audioUploadID": None,
+            "mimeType": entry.mime_type,
+            "fileName": entry.file_name,
+            "durationSeconds": entry.duration_seconds if payload.durationSeconds <= 0 else payload.durationSeconds,
+        }
+    )
+    return updated
 
 
 async def _resolve_optional_session(authorization: Optional[str]) -> Optional[dict]:

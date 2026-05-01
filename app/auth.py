@@ -177,6 +177,30 @@ class AuthStore:
             ollama = connections.get(user_id, {}).get("ollama")
         return ollama
 
+    def delete_user(self, user_id: str) -> None:
+        """
+        Delete all auth data for a user: user record, all sessions, and provider connections.
+
+        Idempotent — succeeds even if the user does not exist.
+        """
+        with _STORE_LOCK:
+            users = _load_json_map(self._users_path)
+            sessions = _load_json_map(self._sessions_path)
+            connections = _load_json_map(self._provider_connections_path)
+
+            users.pop(user_id, None)
+            # Remove every session that belongs to this user.
+            sessions = {
+                token: session
+                for token, session in sessions.items()
+                if session.get("user_id") != user_id
+            }
+            connections.pop(user_id, None)
+
+            _save_json_map(self._users_path, users)
+            _save_json_map(self._sessions_path, sessions)
+            _save_json_map(self._provider_connections_path, connections)
+
 
 def make_auth_store(settings: Settings) -> "AuthStore | Any":
     """

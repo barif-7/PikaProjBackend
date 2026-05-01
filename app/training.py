@@ -215,6 +215,112 @@ class VoiceProfileStore:
             message=message,
         )
 
+    def delete_profile(self, profile_id: str, user_id: Any = None) -> None:
+        """
+        Delete a voice profile and all associated artifacts.
+
+        Raises ``VoiceProfileTrainingError`` if the profile does not exist or the
+        caller does not own it.  Pass ``user_id=None`` to bypass the ownership
+        check (used internally by ``delete_user_profiles``).
+
+        Cleans up:
+          - Local sample, model, reference, adapter, and cosyvoice artifact files
+          - Local manifest JSON
+          - Job entry in the jobs store
+          - Durable store artifacts (Firestore + GCS) when configured
+        """
+        # Load the manifest directly (bypass the owner-checking wrapper) so we
+        # can perform our own conditional ownership assertion below.
+        manifest_path = self.root_dir / "profiles" / f"{profile_id}.json"
+        if self.durable_store and self.durable_store.enabled:
+            manifest = self.durable_store.ensure_manifest_local(profile_id, manifest_path)
+        elif manifest_path.exists():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                raise VoiceProfileTrainingError("The voice profile manifest is unreadable.") from exc
+        else:
+            manifest = None
+
+        if not manifest:
+            raise VoiceProfileTrainingError(f"Unknown voice profile: {profile_id}")
+
+        # Only enforce ownership when the caller provides a user_id.
+        if user_id is not None:
+            self._assert_owner(manifest.get("user_id"), user_id)
+
+        # Remove local artifact files referenced by the manifest.
+        _local_paths_for_manifest = [
+            manifest.get("sample_path"),
+            manifest.get("model_path"),
+            manifest.get("config_path"),
+            manifest.get("reference_path"),
+            manifest.get("reference_audio_path"),
+        ]
+        for path_str in _local_paths_for_manifest:
+            if path_str:
+                p = Path(path_str)
+                if p.exists() and p.is_file():
+                    p.unlink(missing_ok=True)
+
+        for dir_key in ("adapter_path", "cosyvoice_model_dir"):
+            path_str = manifest.get(dir_key)
+            if path_str:
+                p = Path(path_str)
+                if p.exists() and p.is_dir():
+                    import shutil
+                    shutil.rmtree(p, ignore_errors=True)
+
+        # Remove local manifest file.
+        manifest_path = self.root_dir / "profiles" / f"{profile_id}.json"
+        manifest_path.unlink(missing_ok=True)
+
+        # Remove the job entry from the jobs store.
+        job_id = (manifest or {}).get("job_id")
+        if job_id:
+            with _STORE_LOCK:
+                jobs = self._load_jobs_state()
+                if job_id in jobs:
+                    sample_path_str = jobs[job_id].get("sample_path")
+                    if sample_path_str:
+                        Path(sample_path_str).unlink(missing_ok=True)
+                    jobs.pop(job_id, None)
+                    self._save_jobs_state(jobs)
+
+        # Remove durable store artifacts.
+        if self.durable_store and self.durable_store.enabled:
+            self.durable_store.delete_profile(profile_id)
+
+    def delete_user_profiles(self, user_id: Any) -> list[str]:
+        """
+        Delete all voice profiles owned by ``user_id``.
+
+        Returns the list of deleted profile IDs.
+        """
+        if not user_id:
+            return []
+
+        deleted: list[str] = []
+        profiles_dir = self.root_dir / "profiles"
+        if profiles_dir.exists():
+            for manifest_file in list(profiles_dir.glob("*.json")):
+                try:
+                    manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    continue
+                if manifest.get("user_id") == user_id:
+                    profile_id = manifest.get("profile_id") or manifest_file.stem
+                    try:
+                        # Pass user_id=None to bypass the ownership check — we
+                        # already know this profile belongs to the user from the
+                        # manifest query above.
+                        self.delete_profile(profile_id, user_id=None)
+                        deleted.append(profile_id)
+                    except VoiceProfileTrainingError:
+                        pass
+
+        return deleted
+
     def assert_profile_access(self, profile_id: str, user_id: Any = None) -> None:
         manifest = self._load_profile_manifest(profile_id, user_id=None)
         self._assert_owner(manifest.get("user_id"), user_id)

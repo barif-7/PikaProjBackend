@@ -79,6 +79,10 @@ def _make_settings(**overrides) -> Settings:
         voice_job_worker_poll_seconds=1.0,
         voice_job_worker_lease_seconds=300.0,
         voice_job_worker_concurrency=1,
+        audio_upload_ttl_seconds=300.0,
+        rate_limit_requests_per_minute=0,
+        rate_limit_burst=20,
+        max_turns_per_user_per_day=0,
     )
     defaults.update(overrides)
     return Settings(**defaults)

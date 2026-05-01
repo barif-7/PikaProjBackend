@@ -75,6 +75,11 @@ class AuthStoreProtocol(Protocol):
         """Return the raw connection record or ``None`` if absent."""
         ...
 
+    def delete_user(self, user_id: str) -> None:
+        """Delete all auth data for a user: user record, sessions, and provider connections.
+        Idempotent — no error if the user does not exist."""
+        ...
+
 
 @runtime_checkable
 class ConversationStoreProtocol(Protocol):
@@ -99,4 +104,8 @@ class ConversationStoreProtocol(Protocol):
         messages: list[dict[str, str]],
     ) -> dict[str, Any]:
         """Persist and return the updated conversation payload."""
+        ...
+
+    def delete_user_conversations(self, user_id: str) -> None:
+        """Delete all conversations for the given user.  Idempotent."""
         ...

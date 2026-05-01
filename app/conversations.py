@@ -57,6 +57,14 @@ class ConversationStore:
 
         return payload
 
+    def delete_user_conversations(self, user_id: str) -> None:
+        """Delete all conversations for the given user.  Idempotent."""
+        with _STORE_LOCK:
+            conversations = _load_json_map(self._conversations_path)
+            if user_id in conversations:
+                conversations.pop(user_id)
+                _save_json_map(self._conversations_path, conversations)
+
 
 def make_conversation_store(root_dir: str, settings: "Any | None" = None) -> "ConversationStore | Any":
     """

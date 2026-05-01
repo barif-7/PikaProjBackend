@@ -138,6 +138,37 @@ class DurableVoiceProfileStore:
             self._upload_file(manifest_path, f"{prefix}/manifest.json", content_type="application/json")
         return manifest_with_storage
 
+    def delete_profile(self, profile_id: str) -> None:
+        """
+        Delete all durable storage for a voice profile:
+        - Firestore profile document
+        - Firestore jobs documents for this profile
+        - All GCS objects under the profile prefix
+
+        Idempotent — succeeds even if the profile does not exist.
+        """
+        if not self.enabled:
+            return
+
+        # Delete Firestore profile doc.
+        self._firestore().collection(self.profiles_collection).document(profile_id).delete()
+
+        # Delete Firestore job docs that reference this profile.
+        for snap in (
+            self._firestore()
+            .collection(self.jobs_collection)
+            .where("profile_id", "==", profile_id)
+            .stream()
+        ):
+            snap.reference.delete()
+
+        # Delete GCS objects under the profile prefix.
+        prefix = f"{self._profile_prefix(profile_id)}/"
+        bucket = self._get_bucket()
+        blobs = list(self._storage().list_blobs(bucket, prefix=prefix))
+        for blob in blobs:
+            blob.delete()
+
     def ensure_manifest_local(self, profile_id: str, local_manifest_path: Path) -> dict[str, Any] | None:
         if local_manifest_path.exists():
             return json.loads(local_manifest_path.read_text(encoding="utf-8"))

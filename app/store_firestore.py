@@ -244,6 +244,30 @@ class FirestoreAuthStore:
             return None
         return (snap.to_dict() or {}).get("ollama")
 
+    def delete_user(self, user_id: str) -> None:
+        """
+        Delete all auth data for a user: user record, all sessions, and provider connections.
+
+        Idempotent — no error if the user does not exist.
+        """
+        db = self._db()
+
+        # Delete user document.
+        db.collection(self.users_collection).document(user_id).delete()
+
+        # Delete provider connections document.
+        db.collection(self.connections_collection).document(user_id).delete()
+
+        # Delete all sessions that belong to this user.  A session TTL index on
+        # `user_id` would make this O(1) in Firestore — for now we do a query.
+        sessions_query = (
+            db.collection(self.sessions_collection)
+            .where("user_id", "==", user_id)
+            .stream()
+        )
+        for snap in sessions_query:
+            snap.reference.delete()
+
 
 # ---------------------------------------------------------------------------
 # FirestoreConversationStore
@@ -316,6 +340,15 @@ class FirestoreConversationStore:
         }
         self._doc_ref(user_id, conversation_id).set(payload)
         return payload
+
+    def delete_user_conversations(self, user_id: str) -> None:
+        """Delete all conversations for the given user.  Idempotent."""
+        db = self._db()
+        conv_ref = db.collection(self.collection).document(user_id)
+        # Delete the subcollection contents first, then the parent doc.
+        for snap in conv_ref.collection("conversations").stream():
+            snap.reference.delete()
+        conv_ref.delete()
 
 
 # ---------------------------------------------------------------------------

@@ -91,6 +91,17 @@ class Settings:
     voice_job_worker_poll_seconds: float
     voice_job_worker_lease_seconds: float
     voice_job_worker_concurrency: int
+    # ---- Transport --------------------------------------------------------
+    # TTL for temporary audio upload buffers (POST /audio/uploads).
+    # After this many seconds the upload is evicted and the client must re-upload.
+    audio_upload_ttl_seconds: float
+    # ---- Observability / rate limiting ------------------------------------
+    # Per-IP token-bucket rate limit.  Set rate_limit_requests_per_minute to 0
+    # to disable rate limiting entirely.
+    rate_limit_requests_per_minute: int
+    rate_limit_burst: int
+    # Per-user daily voice-chat turn quota.  Set to 0 to disable.
+    max_turns_per_user_per_day: int
 
     @property
     def ollama_chat_url(self) -> str:
@@ -223,5 +234,21 @@ def load_settings() -> Settings:
         voice_job_worker_concurrency=max(
             1,
             int(os.getenv("VOICE_JOB_WORKER_CONCURRENCY", "1").strip()),
+        ),
+        audio_upload_ttl_seconds=max(
+            30.0,
+            float(os.getenv("AUDIO_UPLOAD_TTL_SECONDS", "300").strip()),
+        ),
+        rate_limit_requests_per_minute=max(
+            0,
+            int(os.getenv("RATE_LIMIT_REQUESTS_PER_MINUTE", "120").strip()),
+        ),
+        rate_limit_burst=max(
+            1,
+            int(os.getenv("RATE_LIMIT_BURST", "20").strip()),
+        ),
+        max_turns_per_user_per_day=max(
+            0,
+            int(os.getenv("MAX_TURNS_PER_USER_PER_DAY", "0").strip()),
         ),
     )
