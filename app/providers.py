@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -221,10 +222,19 @@ def _transcribe_with_python_whisper(
             chunks_dir,
             settings,
         )
-        segments = [
-            ((whisper_model.transcribe(str(chunk_path), **transcribe_kwargs) or {}).get("text") or "").strip()
-            for chunk_path in chunk_paths
-        ]
+
+        def _transcribe_chunk(chunk_path: Path) -> str:
+            return ((whisper_model.transcribe(str(chunk_path), **transcribe_kwargs) or {}).get("text") or "").strip()
+
+        max_workers = min(len(chunk_paths), settings.whisper_chunk_max_workers)
+        if max_workers <= 1:
+            segments = [_transcribe_chunk(chunk_path) for chunk_path in chunk_paths]
+        else:
+            # The Whisper model's weights are read-only during inference, so the
+            # shared model can be transcribed concurrently across chunks.
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                segments = list(executor.map(_transcribe_chunk, chunk_paths))
+
         return " ".join(segment for segment in segments if segment).strip()
 
     result = whisper_model.transcribe(str(audio_path), **transcribe_kwargs) or {}
@@ -263,6 +273,52 @@ async def _generate_reply(
 
     body = response.json()
     return ((body.get("message") or {}).get("content") or "").strip()
+
+
+async def _stream_reply(
+    payload: VoiceChatTurnRequest,
+    transcript: str,
+    settings: Settings,
+    ollama_runtime: OllamaRuntimeConfig,
+):
+    """Yield reply text deltas as Ollama generates them (streaming chat)."""
+    request_body = {
+        "model": ollama_runtime.model,
+        "stream": True,
+        "keep_alive": ollama_runtime.keep_alive,
+        "messages": build_chat_messages(
+            payload.history,
+            transcript,
+            conversation_summary=payload.conversationSummary,
+        ),
+        "options": {"temperature": 0.7},
+    }
+
+    headers = {}
+    if ollama_runtime.api_token:
+        headers["Authorization"] = f"Bearer {ollama_runtime.api_token}"
+
+    client = _get_ollama_client(ollama_runtime.base_url, settings.http_timeout_seconds)
+    async with client.stream(
+        "POST", ollama_runtime.chat_url, json=request_body, headers=headers or None
+    ) as response:
+        if response.status_code >= 400:
+            detail = (await response.aread()).decode("utf-8", errors="ignore").strip()
+            raise VoiceChatProviderError(f"Ollama returned {response.status_code}: {detail}")
+
+        async for line in response.aiter_lines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            delta = (obj.get("message") or {}).get("content") or ""
+            if delta:
+                yield delta
+            if obj.get("done"):
+                break
 
 
 def default_ollama_runtime(settings: Settings) -> OllamaRuntimeConfig:

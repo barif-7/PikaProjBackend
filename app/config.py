@@ -19,6 +19,7 @@ class Settings:
     auth_mobile_callback_url: Optional[str]
     auth_data_dir: str
     auth_session_ttl_seconds: float
+    session_cache_ttl_seconds: float
     conversation_data_dir: str
     # Persistence backend: "json" (default, local dev) or "firestore" (production).
     # When "firestore" is active, auth/session/conversation state is stored in
@@ -53,6 +54,7 @@ class Settings:
     whisper_model: str
     whisper_language: Optional[str]
     whisper_chunk_duration_seconds: float
+    whisper_chunk_max_workers: int
     prewarm_whisper_on_startup: bool
     ffmpeg_command: Optional[str]
     piper_command: Optional[str]
@@ -136,6 +138,7 @@ def load_settings() -> Settings:
     prewarm_ollama_on_startup = os.getenv("PREWARM_OLLAMA_ON_STARTUP", "1").strip().lower() not in {"0", "false", "no"}
     whisper_language = os.getenv("WHISPER_LANGUAGE", "en").strip() or None
     whisper_chunk_duration_seconds = float(os.getenv("WHISPER_CHUNK_DURATION_SECONDS", "15").strip())
+    whisper_chunk_max_workers = int(os.getenv("WHISPER_CHUNK_MAX_WORKERS", "2").strip())
     prewarm_whisper_on_startup = os.getenv("PREWARM_WHISPER_ON_STARTUP", "1").strip().lower() not in {"0", "false", "no"}
     ffmpeg_command = os.getenv("FFMPEG_COMMAND", "ffmpeg").strip() or None
     piper_command = os.getenv("PIPER_COMMAND", "").strip() or None
@@ -180,6 +183,7 @@ def load_settings() -> Settings:
         auth_mobile_callback_url=os.getenv("AUTH_MOBILE_CALLBACK_URL", "").strip() or None,
         auth_data_dir=auth_data_dir,
         auth_session_ttl_seconds=float(os.getenv("AUTH_SESSION_TTL_SECONDS", "2592000").strip()),
+        session_cache_ttl_seconds=max(0.0, float(os.getenv("SESSION_CACHE_TTL_SECONDS", "30").strip())),
         conversation_data_dir=conversation_data_dir,
         persistence_backend=os.getenv("PERSISTENCE_BACKEND", "json").strip().lower() or "json",
         auth_users_collection=os.getenv("AUTH_USERS_COLLECTION", "pikaUsers").strip() or "pikaUsers",
@@ -198,6 +202,7 @@ def load_settings() -> Settings:
         whisper_model=os.getenv("WHISPER_MODEL", "base").strip(),
         whisper_language=whisper_language,
         whisper_chunk_duration_seconds=max(0.0, whisper_chunk_duration_seconds),
+        whisper_chunk_max_workers=max(1, whisper_chunk_max_workers),
         prewarm_whisper_on_startup=prewarm_whisper_on_startup,
         ffmpeg_command=ffmpeg_command,
         piper_command=piper_command,
@@ -233,7 +238,7 @@ def load_settings() -> Settings:
         voice_job_worker_lease_seconds=float(os.getenv("VOICE_JOB_WORKER_LEASE_SECONDS", "300").strip()),
         voice_job_worker_concurrency=max(
             1,
-            int(os.getenv("VOICE_JOB_WORKER_CONCURRENCY", "1").strip()),
+            int(os.getenv("VOICE_JOB_WORKER_CONCURRENCY", "2").strip()),
         ),
         audio_upload_ttl_seconds=max(
             30.0,

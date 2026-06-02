@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import socket
+import time
 import uuid
 
 import httpx
 from fastapi import FastAPI, File, Form, Header, Query, Request, UploadFile
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from typing import Any, Dict, Optional, Union
 
@@ -60,7 +62,7 @@ from .training import (
 )
 from .voice_job_store import ClaimedVoiceJob, JobStage, VoiceJob, VoiceJobStore, VoiceJobStoreProtocol
 from .voice_job_store_firestore import FirestoreVoiceJobStore
-from .voice_pipeline import run_pipeline
+from .voice_pipeline import run_pipeline, run_pipeline_streaming
 
 
 logger = logging.getLogger(__name__)
@@ -77,6 +79,27 @@ audio_upload_store = AudioUploadStore(ttl_seconds=settings.audio_upload_ttl_seco
 # Initialised in startup_event; None until then.
 _voice_job_store: Optional[VoiceJobStoreProtocol] = None
 _voice_worker_id = f"{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
+
+# Signalled when a new job is submitted so idle workers wake immediately
+# instead of waiting out the poll interval.  Cross-instance wakeups (Firestore
+# backend, multiple Cloud Run instances) still rely on the poll-interval
+# fallback in the worker loop.
+_new_job_event = asyncio.Event()
+
+# Short-lived cache of validated sessions keyed by bearer token.  Removes a
+# storage round trip on every authenticated request from an active client.
+# Trade-off: a revoked/expired session can stay valid for up to the cache TTL.
+# We invalidate eagerly on sign-out and account deletion to keep that window
+# tight for client-initiated revocation.  Set SESSION_CACHE_TTL_SECONDS=0 to
+# disable.  Maps token -> (monotonic_expiry, session_response).
+_session_cache: dict[str, tuple[float, dict]] = {}
+
+
+def _invalidate_session_cache(session_token: Optional[str] = None) -> None:
+    if session_token is None:
+        _session_cache.clear()
+    else:
+        _session_cache.pop(session_token, None)
 
 # ---------------------------------------------------------------------------
 # Optional API key middleware
@@ -318,6 +341,7 @@ async def delete_auth_session(authorization: Optional[str] = Header(default=None
     try:
         session_token = extract_bearer_token(authorization)
         await _run_blocking(auth_store.revoke_session, session_token)
+        _invalidate_session_cache(session_token)
         return {"status": "signed_out"}
     except AuthError as exc:
         return JSONResponse(status_code=401, content={"message": str(exc)})
@@ -520,6 +544,74 @@ async def voice_chat_turn(
         )
 
 
+@app.post("/voice-chat/stream")
+async def voice_chat_stream(
+    payload: VoiceChatTurnRequest,
+    authorization: Optional[str] = Header(default=None),
+) -> Union[JSONResponse, StreamingResponse]:
+    """
+    Stream a voice-chat turn as Server-Sent Events.
+
+    Validation and auth mirror ``POST /voice-chat/turn``.  Once accepted, the
+    response is a ``text/event-stream`` where each ``data:`` frame is one JSON
+    event from :func:`run_pipeline_streaming` (``transcript``, ``text``,
+    ``audio``, ``done``, or ``error``).  The synchronous and job/poll routes
+    remain available and unchanged.
+    """
+    try:
+        resolved = await _resolve_audio_upload(payload)
+        if isinstance(resolved, JSONResponse):
+            return resolved
+        payload = resolved
+
+        if payload.audioBase64 is not None and len(payload.audioBase64) > settings.max_audio_base64_bytes:
+            return JSONResponse(
+                status_code=413,
+                content={
+                    "message": (
+                        f"Audio payload is too large.  "
+                        f"Maximum allowed: {settings.max_audio_base64_bytes // (1024 * 1024)} MB."
+                    )
+                },
+            )
+
+        session = await _resolve_optional_session(authorization)
+        user = session["user"] if session else None
+
+        if payload.voiceProfileID:
+            await _run_blocking(
+                voice_profile_store.assert_profile_access,
+                payload.voiceProfileID,
+                user_id=user["userId"] if user else None,
+            )
+
+        ollama_runtime = None
+        if user:
+            connection = await _run_blocking(auth_store.ollama_connection, user["userId"])
+            if connection:
+                ollama_runtime = ollama_runtime_for_connection(settings, connection)
+    except AuthError as exc:
+        return JSONResponse(status_code=401, content={"message": str(exc)})
+    except VoiceProfileTrainingError as exc:
+        return JSONResponse(status_code=403, content={"message": str(exc)})
+
+    async def _event_source():
+        try:
+            async for event in run_pipeline_streaming(payload, settings, ollama_runtime=ollama_runtime):
+                yield f"data: {json.dumps(event)}\n\n"
+        except (VoiceChatProviderError, asyncio.TimeoutError) as exc:
+            yield f"data: {json.dumps({'type': 'error', 'error': str(exc)})}\n\n"
+        except Exception as exc:  # pragma: no cover - defensive stream boundary
+            logger.exception("[voice-stream] unexpected error")
+            yield f"data: {json.dumps({'type': 'error', 'error': f'Unexpected error: {exc}'})}\n\n"
+
+    return StreamingResponse(
+        _event_source(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.post("/voice-profiles", response_model=VoiceProfileSubmitResponse)
 async def submit_voice_profile(
     payload: VoiceProfileSubmitRequest,
@@ -614,6 +706,7 @@ async def delete_account(
         # 3. Delete auth data (user, sessions, connections) — also invalidates the
         #    current session token so the client cannot make further authenticated calls.
         await _run_blocking(auth_store.delete_user, user_id)
+        _invalidate_session_cache()
 
         logger.info(
             "[account-deletion] user_id=%s deleted profiles=%d",
@@ -730,12 +823,22 @@ async def _run_voice_job(
         await store.fail(claimed_job.job_id, f"Unexpected pipeline error: {exc}")
 
 
+async def _wait_for_new_job(timeout: float) -> None:
+    """Block until a job is submitted or ``timeout`` elapses, then reset the signal."""
+    try:
+        await asyncio.wait_for(_new_job_event.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        pass
+    finally:
+        _new_job_event.clear()
+
+
 async def _voice_job_worker_loop(store: VoiceJobStoreProtocol, worker_id: str) -> None:
     while True:
         try:
             claimed_job = await store.claim_next(worker_id)
             if claimed_job is None:
-                await asyncio.sleep(settings.voice_job_worker_poll_seconds)
+                await _wait_for_new_job(settings.voice_job_worker_poll_seconds)
                 continue
             await _run_voice_job(claimed_job, store)
         except asyncio.CancelledError:  # pragma: no cover - shutdown boundary
@@ -805,6 +908,7 @@ async def submit_voice_chat_job(
                 headers={"Retry-After": "5"},
             )
 
+        _new_job_event.set()
         return VoiceChatJobSubmitResponse(jobId=job.job_id, stage="queued")
 
     except AuthError as exc:
@@ -882,4 +986,15 @@ async def _resolve_optional_session(authorization: Optional[str]) -> Optional[di
     if not authorization:
         return None
     session_token = extract_bearer_token(authorization)
-    return await _run_blocking(auth_store.session_response, session_token)
+
+    ttl = settings.session_cache_ttl_seconds
+    if ttl > 0:
+        cached = _session_cache.get(session_token)
+        if cached is not None and cached[0] > time.monotonic():
+            return cached[1]
+
+    session = await _run_blocking(auth_store.session_response, session_token)
+
+    if ttl > 0:
+        _session_cache[session_token] = (time.monotonic() + ttl, session)
+    return session

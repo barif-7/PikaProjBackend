@@ -35,11 +35,15 @@ from .providers import (
     _generate_reply,
     _log_turn_timing,
     _resolve_voice_profile_paths,
+    _stream_reply,
     _synthesize_speech,
     _synthesize_with_piper,
     _transcribe_audio,
     default_ollama_runtime,
 )
+
+# Characters that mark the end of a sentence worth synthesizing on its own.
+_SENTENCE_TERMINATORS = ".!?\n"
 
 # Async callable that receives the stage name string, e.g. "transcribing".
 StageCallback = Optional[Callable[[str], Awaitable[None]]]
@@ -151,6 +155,110 @@ async def run_pipeline(
             responseAudioMimeType=response_audio_mime,
             error=None,
         )
+
+
+def _split_complete_sentences(buffer: str) -> tuple[list[str], str]:
+    """Split ``buffer`` into complete sentences and a trailing remainder.
+
+    A sentence is considered complete once a terminator (``.!?`` or newline)
+    is seen.  The remainder (text after the last terminator) is returned so the
+    caller can keep accumulating until the next terminator arrives.
+    """
+    sentences: list[str] = []
+    start = 0
+    for index, char in enumerate(buffer):
+        if char in _SENTENCE_TERMINATORS:
+            sentence = buffer[start : index + 1].strip()
+            if sentence:
+                sentences.append(sentence)
+            start = index + 1
+    return sentences, buffer[start:]
+
+
+async def run_pipeline_streaming(
+    payload: VoiceChatTurnRequest,
+    settings: Settings,
+    ollama_runtime: Optional[OllamaRuntimeConfig] = None,
+):
+    """Run the voice pipeline incrementally, yielding events as they are ready.
+
+    Yields dicts with a ``type`` discriminator:
+
+    - ``{"type": "transcript", "transcript": str}`` once STT completes.
+    - ``{"type": "text", "delta": str}`` for each LLM token delta.
+    - ``{"type": "audio", "audioBase64": str, "mimeType": str, "text": str}``
+      for each synthesized sentence (omitted when TTS is disabled or fails).
+    - ``{"type": "done", "responseText": str}`` at the end.
+
+    Unlike :func:`run_pipeline`, this begins synthesizing speech sentence by
+    sentence as the LLM streams, so the first audio reaches the client well
+    before the full reply is generated.  The job/poll path is unaffected.
+    """
+    runtime = ollama_runtime or default_ollama_runtime(settings)
+
+    try:
+        audio_bytes = decode_uploaded_audio(payload.audioBase64, payload.audioChunks)
+    except AudioUploadError as exc:
+        raise VoiceChatProviderError(str(exc)) from exc
+
+    with tempfile.TemporaryDirectory(prefix="pika-pipeline-stream-") as temp_dir:
+        temp_path = Path(temp_dir)
+        audio_path = temp_path / payload.fileName
+        audio_path.write_bytes(audio_bytes)
+
+        transcript = await asyncio.wait_for(
+            _transcribe_audio(audio_path, temp_path, settings, payload.durationSeconds),
+            timeout=settings.stt_timeout_seconds,
+        )
+        if not transcript:
+            raise VoiceChatProviderError("Whisper returned an empty transcript.")
+        yield {"type": "transcript", "transcript": transcript}
+
+        full_reply_parts: list[str] = []
+        buffer = ""
+        sentence_index = 0
+
+        async def _emit_sentence(sentence: str):
+            nonlocal sentence_index
+            if not settings.is_tts_enabled:
+                return None
+            sentence_dir = temp_path / f"sentence-{sentence_index}"
+            sentence_dir.mkdir(parents=True, exist_ok=True)
+            sentence_index += 1
+            audio_b64, mime = await _synthesize_with_fallback(
+                sentence, sentence_dir, settings, payload.voiceProfileID
+            )
+            if audio_b64 is None:
+                return None
+            return {
+                "type": "audio",
+                "audioBase64": audio_b64,
+                "mimeType": mime,
+                "text": sentence,
+            }
+
+        async for delta in _stream_reply(payload, transcript, settings, runtime):
+            full_reply_parts.append(delta)
+            buffer += delta
+            yield {"type": "text", "delta": delta}
+
+            sentences, buffer = _split_complete_sentences(buffer)
+            for sentence in sentences:
+                event = await _emit_sentence(sentence)
+                if event is not None:
+                    yield event
+
+        remainder = buffer.strip()
+        if remainder:
+            event = await _emit_sentence(remainder)
+            if event is not None:
+                yield event
+
+        response_text = "".join(full_reply_parts).strip()
+        if not response_text:
+            raise VoiceChatProviderError("The language model returned an empty response.")
+
+        yield {"type": "done", "responseText": response_text}
 
 
 async def _synthesize_with_fallback(
