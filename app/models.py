@@ -213,3 +213,25 @@ class VoiceChatJobStatusResponse(BaseModel):
     responseAudioBase64: Optional[str] = None
     responseAudioMimeType: Optional[str] = None
     error: Optional[str] = None
+
+
+class TTSSynthesizeRequest(BaseModel):
+    """Request body for POST /tts — standalone text-to-speech."""
+    text: str
+    voiceProfileID: Optional[str] = None
+
+    @field_validator("text")
+    @classmethod
+    def text_not_empty(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("text must not be blank.")
+        if len(v) > 50_000:
+            raise ValueError("text exceeds the maximum of 50 000 characters.")
+        return v
+
+
+class TTSSynthesizeResponse(BaseModel):
+    """Response body for POST /tts — base64-encoded WAV audio."""
+    audioBase64: str
+    mimeType: str = "audio/wav"

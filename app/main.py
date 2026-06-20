@@ -41,6 +41,8 @@ from .models import (
     ConversationStateUpdateRequest,
     OllamaConnectionRequest,
     OllamaConnectionResponse,
+    TTSSynthesizeRequest,
+    TTSSynthesizeResponse,
     VoiceChatJobStatusResponse,
     VoiceChatJobSubmitResponse,
     VoiceChatTurnRequest,
@@ -52,6 +54,7 @@ from .models import (
 )
 from .providers import (
     VoiceChatProviderError,
+    _synthesize_speech,
     generate_turn_response,
     ollama_runtime_for_connection,
     prewarm_runtime,
@@ -947,6 +950,55 @@ async def get_voice_chat_job_status(
         resp.error = job.error
 
     return resp
+
+
+# ---------------------------------------------------------------------------
+# Standalone TTS endpoint
+# ---------------------------------------------------------------------------
+
+
+@app.post("/tts", response_model=TTSSynthesizeResponse)
+async def synthesize_text(
+    payload: TTSSynthesizeRequest,
+) -> Union[JSONResponse, TTSSynthesizeResponse]:
+    """
+    Standalone text-to-speech synthesis.
+
+    Accepts plain text and returns base64-encoded WAV audio using the
+    configured TTS provider (Piper, XTTS, or CosyVoice).
+    """
+    import base64 as _b64
+    import tempfile
+    from pathlib import Path
+
+    if not settings.is_tts_enabled:
+        return JSONResponse(
+            status_code=503,
+            content={"message": "No TTS provider is configured on this backend."},
+        )
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="pika-tts-") as temp_dir:
+            wav_bytes = await asyncio.wait_for(
+                _synthesize_speech(
+                    payload.text,
+                    Path(temp_dir),
+                    settings,
+                    payload.voiceProfileID,
+                ),
+                timeout=settings.tts_timeout_seconds,
+            )
+            return TTSSynthesizeResponse(
+                audioBase64=_b64.b64encode(wav_bytes).decode("utf-8"),
+                mimeType="audio/wav",
+            )
+    except asyncio.TimeoutError:
+        return JSONResponse(
+            status_code=504,
+            content={"message": f"TTS synthesis timed out after {settings.tts_timeout_seconds}s."},
+        )
+    except VoiceChatProviderError as exc:
+        return JSONResponse(status_code=500, content={"message": str(exc)})
 
 
 async def _resolve_audio_upload(payload: Any) -> Any:
